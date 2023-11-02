@@ -2,8 +2,8 @@
 
 This is an PyTorch implementation of MNN proposed by our paper [MNN: Mixed Nearest-Neighbors for Self-Supervised Learning](https://arxiv.org/abs/2311.00562). If you find this repo useful, welcome 🌟🌟🌟✨.
 
-> ![figure1](./figures/mnn.png "MNN_overview")
-> 
+![figure1](./figures/mnn.png "MNN_overview")
+
 
 ## Requirements
 To install requirements:
