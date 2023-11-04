@@ -1,51 +1,31 @@
 import torch
-from util.meter import *
-
-from network.MNN import MNN
-import time
-import os
-from dataset import data_two
-from dataset import data_three
-from dataset import data_four
-from dataset.data_public import *
-import random
-import math
-import argparse
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from torchvision import datasets
-import numpy as np
+
+from util.meter import *
 from util.utils import *
+from dataset import data_two
+from dataset.data_public import *
+
+# =========== Different algorithmic frameworks ===========
+from network.MNN import MNN
+
+import argparse
+import os
 import time
 import datetime
 
-# import tqdm
-
 def get_args_parser():
     parser = argparse.ArgumentParser('Pretrain pipeline', add_help=False)
-    parser.add_argument('--name', type=str, default='')
-    parser.add_argument('--doc', type=str, default='Test', help='To describe what this training is about')
-    parser.add_argument('--aug_numbers', type=int, default=2)
-    parser.add_argument('--topk', default=5, type=int, help='K-nearest neighbors')
-    parser.add_argument('--gpuid', default='1', type=str, help='gpuid')
-    parser.add_argument('--logdir', default='current', type=str, help='log')
-    parser.add_argument('--lamda', type=float, default=0.5, help='ratio of synthesis')
-
-    parser.add_argument('--weak', default=False, action='store_true', help='weak aug for teacher')
+    # ===================== network structure =====================
+    parser.add_argument('--name', type=str, default='', help='Name of the algorithm used for pre-training.')
+    parser.add_argument('--doc', type=str, default='practice makes perfect',
+                        help='To describe what this training is about')
     parser.add_argument('--symmetric', default=False, action='store_true',
                         help='use a symmetric loss function that backprops to both crops')
-
-    parser.add_argument('--dataset', type=str, default='cifar10')
-    parser.add_argument('--data_path', type=str, default='/mnt/data/dataset',
-                        help='path of dataset (default: \'./dataset\')')
-    parser.add_argument('--port', type=int, default=23456)
-    parser.add_argument('--queue_size', type=int, default=4096, help='Queue size')
     parser.add_argument('--batch_size', type=int, default=256)
-    parser.add_argument('--dim', type=int, default=128)
-    # parser.add_argument('--aug_numbers', type=int, default=2)
-    # parser.add_argument('--base_lr', type=float, default=0.06)
-    parser.add_argument('--tem', type=float, default=0.1, help='Temperature used in the loss function')
-    parser.add_argument('--threshold', default=False, action='store_true', help='soft label\'threshold for SNCLR')
+    parser.add_argument('--dim', type=int, default=128, help='Dimension of embedded features')
+
     parser.add_argument('--cos_mom', default=False, action='store_true', help='cosine schedule for momentum')
     parser.add_argument('--cos_tem', default=False, action='store_true', help='cosine schedule for temperature')
     parser.add_argument('--momentum', type=float, default=0.0, help='momentum for teacher')
@@ -58,42 +38,40 @@ def get_args_parser():
     parser.add_argument('--warmup_lr_epochs', default=5, type=int,
                         help='Number of warmup epochs for the learning rate (Default: 5).')
     parser.add_argument('--epochs', type=int, default=200)
+
+    # ===================== data =====================
+    parser.add_argument('--dataset', type=str, default='cifar10')
+    parser.add_argument('--data_path', type=str, default='/mnt/data/dataset',
+                        help='path of dataset (default: \'./dataset\')')
+    parser.add_argument('--aug_numbers', type=int, default=2, help='The number of data augmentations required by the '
+                                                                   'algorithm, typically 2')
+    parser.add_argument('--weak', default=False, action='store_true', help='weak aug for teacher')
+
+    # ===================== Parameters for the customization of specific algorithms =====================
+    parser.add_argument('--queue_size', type=int, default=4096, help='Queue size')
+    parser.add_argument('--topk', default=5, type=int, help='K-nearest neighbors')
+    parser.add_argument('--lamda', type=float, default=0.5, help='ratio of synthesis')
+    parser.add_argument('--random_lamda', default=False, action='store_true', help='whether use random number to lamda')
+
+    # ===================== hardware setup =====================
+    parser.add_argument('--gpuid', default='1', type=str, help='gpuid')
+    parser.add_argument('--port', type=int, default=23456)
     parser.add_argument('--seed', type=int, default=1339)
-    parser.add_argument('--norm_nn', default=False, action='store_true', help='whether normalize before mix nn and z_k')
-    parser.add_argument('--random_lamda', default=False, action='store_true', help='use random number for lamda')
+
+    # ===================== Naming of the output file =====================
+    parser.add_argument('--logdir', default='current', type=str, help='log')
 
     return parser
 
-def knn_predict(feature, feature_bank, feature_labels, classes, knn_k, knn_t):
-    # compute cos similarity between each feature vector and feature bank ---> [B, N]
-    sim_matrix = torch.mm(feature, feature_bank)
-    # [B, K]
-    sim_weight, sim_indices = sim_matrix.topk(k=knn_k, dim=-1)
-    # [B, K]
-    sim_labels = torch.gather(feature_labels.expand(feature.size(0), -1), dim=-1, index=sim_indices)
-    sim_weight = (sim_weight / knn_t).exp()
-
-    # counts for each class
-    one_hot_label = torch.zeros(feature.size(0) * knn_k, classes, device=sim_labels.device)
-    # [B*K, C]
-    one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
-    # weighted score ---> [B, C]
-    pred_scores = torch.sum(one_hot_label.view(feature.size(0), -1, classes) * sim_weight.unsqueeze(dim=-1), dim=1)
-
-    pred_labels = pred_scores.argsort(dim=-1, descending=True)
-    return pred_labels
-
-
 def train(train_loader, model, optimizer, lr_schedule, epoch, iteration_per_epoch, args):
     ce_losses = AverageMeter('CE', ':.4e')
+    lr_ave = AverageMeter('LR', ':.4e')
+    # Used for top-k neighbors computation purity
     purity_ave = AverageMeter('PUR', ':.4e')
 
     # switch to train mode
     model.train()
     start_time = time.time()
-
-    momentum = args.momentum
-    tem = args.tem
 
     for i, ((ims, labels)) in enumerate(train_loader):
         it = iteration_per_epoch * epoch + i
@@ -104,25 +82,26 @@ def train(train_loader, model, optimizer, lr_schedule, epoch, iteration_per_epoc
         for i in range(len(ims)):
             ims[i] = ims[i].cuda(non_blocking=True)
         labels = labels.cuda(non_blocking=True)
+
         # print('labels: ', labels)
         if len(ims) == 2:
-            loss, purity = model(ims[0], ims[1], labels=labels, momentum=momentum, epoch=epoch, tem=tem)
+            loss, purity = model(ims[0], ims[1], labels=labels)
+        else:
+            print('error')
 
-        # acc1/acc5 are (K+1)-way contrast classifier accuracy
-        # measure accuracy and record loss
+        # record loss and learning rate
         ce_losses.update(loss.item(), ims[0].size(0))
+        lr_ave.update(lr_schedule[it].item(), ims[0].size(0))
         purity_ave.update(purity.item(), ims[0].size(0))
-
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
     epoch_time = time.time() - start_time
 
-    # print(distr_ave/iteration_per_epoch)
-    return ce_losses.avg, purity_ave.avg, str(datetime.timedelta(seconds=int(epoch_time)))
-
+    return ce_losses.avg, purity_ave.avg, str(datetime.timedelta(seconds=int(epoch_time))), lr_ave.avg
 
 # test using a knn monitor
 def online_test(net, memory_data_loader, test_data_loader, args):
@@ -162,16 +141,31 @@ def online_test(net, memory_data_loader, test_data_loader, args):
 
 def main():
     setup_seed(args.seed)
+
+    # args.gpuid = '0'
+    # args.name = 'moco'
+    # args.tem = 0.2
+    # args.aug_numbers = 2
+    # args.symmetric = True
+    # args.momentum = 0.99
+
+    # args.topk = 3
+    # args.weak = True
+    # args.queue_size = 8
+    # args.batch_size = 4
+    # args.dataset = 'stl10'
+
     print(args)
 
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpuid
 
+
     if args.name == 'mnn':
-        model = MNN(dim=args.dim, dataset=args.dataset, K=args.queue_size, topk=args.topk, symmetric=args.symmetric, lamda=args.lamda, norm_nn=args.norm_nn, random_lamda=args.random_lamda)
+        model = MNN(dataset=args.dataset, K=args.queue_size, momentum=args.momentum, topk=args.topk, symmetric=args.symmetric, lamda=args.lamda, random_lamda=args.random_lamda)
     else:
-        print("....")
+        print('The algorithm does not exist.')
 
     model = model.cuda()
     torch.backends.cudnn.benchmark = True
@@ -194,18 +188,32 @@ def main():
         test_dataset = datasets.CIFAR10(root=args.data_path, train=False, download=False,
                                         transform=get_test_augment('cifar10'))
         args.num_classes = 10
+    elif args.dataset == 'stl10':
+        if args.weak:
+            dataset = eval(aug + 'STL10Pair')(root=args.data_path, download=False, split='train+unlabeled',
+                                              transform=get_contrastive_augment('stl10'),
+                                              # transform=get_weak_augment('stl10'), ablation weak/weak in MNN
+                                              weak_aug=get_weak_augment('stl10'))
+        else:
+            dataset = eval(aug + 'STL10Pair')(root=args.data_path, download=False, split='train+unlabeled',
+                                              transform=get_contrastive_augment('stl10'), weak_aug=None)
+        memory_dataset = datasets.STL10(root=args.data_path, download=False, split='train',
+                                        transform=get_test_augment('stl10'))
+        test_dataset = datasets.STL10(root=args.data_path, download=False, split='test',
+                                      transform=get_test_augment('stl10'))
+        args.num_classes = 10
     elif args.dataset == 'tinyimagenet':
         if args.weak:
-            dataset = eval(aug + 'TinyImageNet')(root=args.data_path + '/tiny-imagenet-200', train=True,
+            dataset = TinyImageNet(root=args.data_path + '/tiny-imagenet-200', train=True,
                                                  transform=eval(aug + crop)(get_contrastive_augment('tinyimagenet'),
                                                                             get_weak_augment('tinyimagenet')))
         else:
-            dataset = eval(aug + 'TinyImageNet')(root=args.data_path + '/tiny-imagenet-200', train=True,
+            dataset = TinyImageNet(root=args.data_path + '/tiny-imagenet-200', train=True,
                                                  transform=eval(aug + crop)(get_contrastive_augment('tinyimagenet'),
                                                                             get_contrastive_augment('tinyimagenet')))
-        memory_dataset = eval(aug + 'TinyImageNet')(root=args.data_path + '/tiny-imagenet-200', train=True,
+        memory_dataset = TinyImageNet(root=args.data_path + '/tiny-imagenet-200', train=True,
                                                     transform=get_test_augment('tinyimagenet'))
-        test_dataset = eval(aug + 'TinyImageNet')(root=args.data_path + '/tiny-imagenet-200', train=False,
+        test_dataset = TinyImageNet(root=args.data_path + '/tiny-imagenet-200', train=False,
                                                   transform=get_test_augment('tinyimagenet'))
         args.num_classes = 200
     else:
@@ -250,23 +258,21 @@ def main():
         start_epoch = 0
         print(checkpoint_path, 'not found, start from epoch 0')
 
-    model.train()
-    best_acc = 0
-    best_purity = 0
     if start_epoch >= args.epochs-1:
         print('Done!')
         exit(0)
-        
+
+    model.train()
+    best_acc = 0
+
     for epoch in range(start_epoch, args.epochs):
-        train_loss, purity_ave, epoch_time  = train(train_loader, model, optimizer, lr_schedule, epoch, iteration_per_epoch, args)
+        train_loss, purity_ave, epoch_time, lr_ave = train(train_loader, model, optimizer, lr_schedule, epoch, iteration_per_epoch, args)
         cur_acc = online_test(model.net, memory_loader, test_loader, args)
         if cur_acc > best_acc:
             best_acc = cur_acc
-        if purity_ave > best_purity:
-            best_purity = purity_ave
-
         print(
-            f'Epoch [{epoch}/{args.epochs}]: 200-NN-Best: {best_acc:.4f}!, 200-NN: {cur_acc:.4f}, Purity: {purity_ave:.4f}, loss: {train_loss:.8f} time: {epoch_time}')
+            f'Epoch [{epoch}/{args.epochs}]: 200-NN-Best: {best_acc:.2f}, 200-NN: {cur_acc:.2f}, '
+            f'Purity: {purity_ave:.4f}, loss: {train_loss:.8f}, time: {epoch_time}, lr: {lr_ave:.4f}')
 
         if epoch == args.epochs - 1:
             torch.save(

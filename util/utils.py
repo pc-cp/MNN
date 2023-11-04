@@ -15,9 +15,161 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.parameter import Parameter
 import numpy as np
 import random
+import pandas as pd
+from sklearn.manifold import TSNE
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
 
-# Unmix
+def generation_mask(topk, batch):
+    """Pseudo label generation for the introduction of top-k nearest neighbor methods.
+        This code was taken and adapted from here:
+        ###
+
+        Args:
+            topk:
+                Number of neighbors
+            batch:
+                batch_size
+
+        Returns:
+            mask:
+                Pseudo-labeling with dimensions [batch, batch*topk]
+    Examples:
+    >>> generation_mask(2, 3)
+    Out[5]:
+    tensor([[1., 1., 0., 0., 0., 0.],
+            [0., 0., 1., 1., 0., 0.],
+            [0., 0., 0., 0., 1., 1.]])
+    """
+    mask_ = torch.eye(batch)
+    mask = mask_.repeat(topk, 1).reshape(topk, batch, -1).permute(2, 1, 0).reshape(batch, topk * batch)
+    return mask
+
+def tsne_plot(save_dir, targets, outputs, epoch):
+    print('generating t-SNE plot...')
+    tsne = TSNE(random_state=0)
+    tsne_output = tsne.fit_transform(outputs)
+
+    df = pd.DataFrame(tsne_output, columns=['x', 'y'])
+    df['classes'] = targets
+
+    plt.rcParams['figure.figsize'] = 10, 10
+    sns.scatterplot(
+        x='x', y='y',
+        hue='classes',
+        palette=sns.color_palette("hls", 10),
+        data=df,
+        marker='o',
+        legend="full",
+        alpha=0.5
+    )
+
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel('')
+    plt.ylabel('')
+
+    plt.savefig(os.path.join(save_dir, 'tsne'+str(epoch)+'.png'), bbox_inches='tight', dpi=1000)
+    plt.clf()
+    print('done!')
+
+
+
+class LinearHead(nn.Module):
+    """Classifiers for downstream tasks.
+
+        This code was taken and adapted from here:
+        # https://github.com/mingkai-zheng/ReSSL/blob/4d67daaa3fd65e81adeb02017a1cfd4d2e2168cb/network/head.py#L6
+
+        Args:
+            net:
+                Pre-trained backbone
+            dim_in:
+                Embedding dimension of sample features
+            num_class:
+                Number of classes in the dataset
+
+        Returns:
+            Classification of downstream tasks
+    """
+    def __init__(self, net, dim_in=2048, num_class=1000):
+        super().__init__()
+        self.net = net
+        self.fc = nn.Linear(dim_in, num_class)
+
+        for param in self.net.parameters():
+            param.requires_grad = False
+
+        self.fc.weight.data.normal_(mean=0.0, std=0.01)
+        self.fc.bias.data.zero_()
+
+    def forward(self, x):
+        with torch.no_grad():
+            feat = self.net(x)
+        return self.fc(feat)
+
+
+def knn_predict(feature, feature_bank, feature_labels, classes, knn_k, knn_t):
+    """A common way of evaluating self-supervised learning.
+
+        This code was taken and adapted from here:
+        # knn monitor as in InstDisc https://arxiv.org/abs/1805.01978
+        # implementation follows http://github.com/zhirongw/lemniscate.pytorch and https://github.com/leftthomas/SimCLR
+
+        Args:
+            feature:
+                Features of the current batch size in the test set
+            feature_bank:
+                Features of all samples in the training set
+            feature_labels:
+                The labels of all samples in the training set, corresponding to feature_bank.
+            classes:
+                Total number of classes in the dataset
+            knn_k:
+                Number of top-k neighbors
+            knn_t:
+                The weights of the KNN
+
+        Returns:
+            pred_labels:
+                Labels predicted by the current test sample
+    """
+    # compute cos similarity between each feature vector and feature bank ---> [B, N]
+    sim_matrix = torch.mm(feature, feature_bank)
+    # [B, K]
+    sim_weight, sim_indices = sim_matrix.topk(k=knn_k, dim=-1)
+    # [B, K]
+    sim_labels = torch.gather(feature_labels.expand(feature.size(0), -1), dim=-1, index=sim_indices)
+    sim_weight = (sim_weight / knn_t).exp()
+
+    # counts for each class
+    one_hot_label = torch.zeros(feature.size(0) * knn_k, classes, device=sim_labels.device)
+    # [B*K, C]
+    one_hot_label = one_hot_label.scatter(dim=-1, index=sim_labels.view(-1, 1), value=1.0)
+    # weighted score ---> [B, C]
+    pred_scores = torch.sum(one_hot_label.view(feature.size(0), -1, classes) * sim_weight.unsqueeze(dim=-1), dim=1)
+
+    pred_labels = pred_scores.argsort(dim=-1, descending=True)
+    return pred_labels
+
+
 def rand_bbox(size, lam):
+    """Used for cutmix to mix two images, to determine the range of images to be mixed.
+
+    This code was taken and adapted from here:
+    https://github.com/haohang96/bingo/blob/1c632fc37c5d22225d3af70bd85172192504d62e/utils.py#L20.
+
+    Args:
+        size:
+            The size of the original image.
+        lam:
+            The scale of the original image as a proportion of the mixed image.
+            lam takes the value in the range [0, 1].
+    Returns:
+        bbx1, bby1, bbx2, bby2:
+            four quadrants of the mixing area
+    """
     W = size[2]
     H = size[3]
     cut_rat = np.sqrt(1. - lam)
@@ -35,9 +187,14 @@ def rand_bbox(size, lam):
 
     return bbx1, bby1, bbx2, bby2
 
-
-# ReSSL
+# come from ReSSL
 def setup_seed(seed):
+    """Used to set a random seed to keep the parameter seed consistent during reproduction.
+
+    Args:
+        seed:
+            random number
+    """
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
