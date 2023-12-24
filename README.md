@@ -31,7 +31,10 @@ Our model achieves the following performance:
 
 | -             | CIFAR-10  | CIFAR-100 | STL-10    | Tiny ImageNet |
 |---------------|-----------|-----------|-----------|---------------|
-| MSF           | 90.19     | 59.22     | 88.05     | 42.68         |
+| MSF           | 89.94     | 59.94     | 88.05     | 42.68         |
 | **MNN(Ours)** | **91.47** | **67.56** | **91.61** | **50.70**     |
+
+![figure2](./figures/t_sne.png "t_sne")
+
 ## Contributors and Contact
 >📋  If there are any questions, feel free to contact with the authors.
