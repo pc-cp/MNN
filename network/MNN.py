@@ -6,15 +6,17 @@ import copy
 from util.NNMemoryBankModule import NNMemoryBankModule
 from util.utils import *
 class MNN(nn.Module):
-    def __init__(self, dim=128, K=4096, momentum=-1, topk=1, dataset='cifar10', bn_splits=8, symmetric=False, lamda=-1.0, random_lamda=False):
+    def __init__(self, dim=128, K=4096, momentum=-1, topk=1, dataset='cifar10', bn_splits=8, symmetric=False, lamda=-1.0, random_lamda=False, norm_nn=False):
         super(MNN, self).__init__()
 
+        self.dim = dim
         self.K = K
         self.momentum = momentum
         self.topk = topk
         self.symmetric = symmetric
         self.lamda = lamda
         self.random_lamda = random_lamda
+        self.norm_nn = norm_nn
         # create the encoders
         self.net               = ModelBase_ResNet18(dataset=dataset, bn_splits=bn_splits)
         self.backbone_momentum = copy.deepcopy(self.net)
@@ -53,12 +55,15 @@ class MNN(nn.Module):
             #  lamda in (0, 1). not include 0 and 1
             self.lamda = torch.rand(1).cuda()
 
-        # if self.norm_nn:
-        #     z_k_topk_norm = z_k_norm.repeat(1, self.topk).reshape(-1, self.dim)
-        #     z_k_nn_norm = nn.functional.normalize(self.lamda*nn.functional.normalize(z_k_nn, dim=1)+(1-self.lamda)*z_k_topk_norm, dim=1)
-        # else:
-        z_k_repeat_topk = z_k.repeat(1, self.topk).reshape(-1, feature_dim)
-        z_k_nn_norm = nn.functional.normalize(self.lamda*z_k_nn + (1-self.lamda)*z_k_repeat_topk, dim=1)
+        if self.norm_nn:
+            z_k_topk_norm = z_k_norm.repeat(1, self.topk).reshape(-1, self.dim)
+            # norm3, as in R2
+            z_k_nn_norm = self.lamda*nn.functional.normalize(z_k_nn, dim=1)+(1-self.lamda)*z_k_topk_norm
+
+            # z_k_nn_norm = nn.functional.normalize(self.lamda*nn.functional.normalize(z_k_nn, dim=1)+(1-self.lamda)*z_k_topk_norm, dim=1)
+        else:
+            z_k_repeat_topk = z_k.repeat(1, self.topk).reshape(-1, feature_dim)
+            z_k_nn_norm = nn.functional.normalize(self.lamda*z_k_nn + (1-self.lamda)*z_k_repeat_topk, dim=1)
 
 
         dist_qk = 2 - 2 * torch.einsum('bc,kc->bk', [p_q_norm, z_k_norm])
@@ -83,12 +88,14 @@ class MNN(nn.Module):
         update_momentum(model=self.net,             model_ema=self.backbone_momentum,        m=self.momentum)
         update_momentum(model=self.projection_head, model_ema=self.projection_head_momentum, m=self.momentum)
 
+        if self.symmetric:  # symmetric loss
+            loss_21, purity_21 = self.contrastive_loss(im2, im1, update=False, labels=labels)
+
         loss_12, purity_12 = self.contrastive_loss(im1, im2, update=True, labels=labels)
         loss = loss_12
         purity = purity_12
-        # compute loss
+        # compute losss
         if self.symmetric:  # symmetric loss
-            loss_21, purity_21 = self.contrastive_loss(im2, im1, update=False, labels=labels)
             purity = (purity_12 + purity_21)*1.0/2
             loss = (loss_12 + loss_21)*1.0/2
 
