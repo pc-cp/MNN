@@ -1,5 +1,9 @@
 # MNN: Mixed Nearest Neighbors for Self-Supervised Learning
 
+## Updata(12,Sep, 2024)
+- **<font size=4>MNN has been accepted in PR(Pattern Recognition)!!</font>**.
+
+
 This is an PyTorch implementation of MNN proposed by our paper [MNN: Mixed Nearest-Neighbors for Self-Supervised Learning](https://arxiv.org/abs/2311.00562). If you find this repo useful, welcome 🌟🌟🌟✨.
 
 ![figure1](./figures/mnn.png "MNN_overview")
@@ -57,6 +61,22 @@ Our model achieves the following performance:
 | **MNN(Ours)** | **91.47** | **67.56** | **91.61** | **50.70**     |
 
 ![figure2](./figures/t_sne.png "t_sne")
+
+## Citation
+If you find this repo useful for your research, please consider citing the paper
+
+```
+@article{LONG2025110998,
+title = {MNN: Mixed nearest-neighbors for self-supervised learning},
+journal = {Pattern Recognition},
+volume = {158},
+pages = {110998},
+year = {2025},
+issn = {0031-3203},
+doi = {https://doi.org/10.1016/j.patcog.2024.110998},
+url = {https://www.sciencedirect.com/science/article/pii/S0031320324007490},
+author = {Xianzhong Long and Chen Peng and Yun Li}
+```
 
 ## Contributors and Contact
 >📋  If there are any questions, feel free to contact with the authors.
